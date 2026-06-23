@@ -74,12 +74,12 @@ def cmd_lock(demo=False):
     sys.exit(app.exec())
 
 
-def cmd_enroll():
-    """Open enrollment management window."""
+def cmd_settings():
+    """Open full settings application."""
     app = setup_app()
 
-    from src.enrollment_window import EnrollmentWindow
-    window = EnrollmentWindow()
+    from src.settings_app import SettingsApp
+    window = SettingsApp()
     window.show()
 
     signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -137,7 +137,7 @@ def cmd_test():
 
     enrolled = fp.list_enrolled_fingers()
     if not enrolled:
-        print("❌ No fingerprints enrolled! Run: python3 -m src.main enroll")
+        print("❌ No fingerprints enrolled! Run: python3 -m src.main settings")
         return
 
     print("Place your finger on the sensor...")
@@ -177,16 +177,16 @@ def cmd_test():
 
 def main():
     if len(sys.argv) < 2:
-        print(__doc__)
-        sys.exit(1)
+        cmd_settings()
+        sys.exit(0)
 
     command = sys.argv[1].lower()
 
     if command == "lock":
         demo = "--demo" in sys.argv
         cmd_lock(demo=demo)
-    elif command == "enroll":
-        cmd_enroll()
+    elif command in ("enroll", "settings"):
+        cmd_settings()
     elif command == "status":
         cmd_status()
     elif command == "test":

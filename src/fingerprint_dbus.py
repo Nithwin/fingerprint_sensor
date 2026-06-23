@@ -287,12 +287,6 @@ class FingerprintManager:
         if self._on_verify_status:
             self._on_verify_status(status, is_match)
 
-        if done:
-            try:
-                self.stop_verify()
-            except Exception:
-                pass
-
     def _handle_enroll_status(self, status, done):
         """Handle EnrollStatus signal from fprintd."""
         status = str(status)
@@ -303,12 +297,6 @@ class FingerprintManager:
 
         if self._on_enroll_status:
             self._on_enroll_status(status, completed)
-
-        if done:
-            try:
-                self.stop_enrollment()
-            except Exception:
-                pass
 
     def cleanup(self):
         """Clean up resources."""

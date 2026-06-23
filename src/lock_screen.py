@@ -89,14 +89,71 @@ class LockScreen(QWidget):
         self._setup_ui()
 
     def _setup_background(self):
-        """Capture and blur the current desktop for background."""
+        """Setup background based on config (blur, image, video)."""
         self._bg_pixmap = None
+        self._video_widget = None
+        self._media_player = None
+        self._bg_type = config.get("background_type", "blur")
+        self._bg_path = config.get("background_path", "")
+
+        # Try to capture desktop for blur first (fallback for image/video errors)
         try:
             screen = QGuiApplication.primaryScreen()
             if screen:
                 self._bg_pixmap = screen.grabWindow(0)
         except Exception:
             pass
+
+        # If image, try to load it
+        if self._bg_type == "image" and self._bg_path and os.path.exists(self._bg_path):
+            img = QPixmap(self._bg_path)
+            if not img.isNull():
+                self._bg_pixmap = img
+
+        # If video, try to setup media player
+        elif self._bg_type == "video" and self._bg_path and os.path.exists(self._bg_path):
+            try:
+                from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+                from PyQt6.QtMultimediaWidgets import QVideoWidget
+                from PyQt6.QtCore import QUrl
+                
+                # We need a layout for the video widget underneath everything
+                # This will be handled in _setup_ui by inserting it at index 0
+                self._video_widget = QVideoWidget(self)
+                self._video_widget.setGeometry(self.rect())
+                self._video_widget.lower() # Push to back
+                
+                self._media_player = QMediaPlayer()
+                self._audio_output = QAudioOutput()
+                self._media_player.setAudioOutput(self._audio_output)
+                self._media_player.setVideoOutput(self._video_widget)
+                
+                # Loop video
+                self._media_player.mediaStatusChanged.connect(self._loop_video)
+                self._media_player.setSource(QUrl.fromLocalFile(self._bg_path))
+                
+                # Mute background video by default
+                self._audio_output.setVolume(0.0)
+                
+                self._media_player.play()
+                
+            except ImportError:
+                print("[LockScreen] QtMultimedia not available, falling back to blur")
+                self._bg_type = "blur"
+                
+    def _loop_video(self, status):
+        try:
+            from PyQt6.QtMultimedia import QMediaPlayer
+            if status == QMediaPlayer.MediaStatus.EndOfMedia:
+                self._media_player.setPosition(0)
+                self._media_player.play()
+        except ImportError:
+            pass
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, '_video_widget') and self._video_widget is not None:
+            self._video_widget.setGeometry(self.rect())
 
     def _setup_ui(self):
         """Build the lock screen UI."""
@@ -240,8 +297,8 @@ class LockScreen(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
-        # Draw blurred/darkened background
-        if self._bg_pixmap and not self._bg_pixmap.isNull():
+        # Draw blurred/darkened background if not using video
+        if self._bg_type != "video" and self._bg_pixmap and not self._bg_pixmap.isNull():
             # Scale to fill
             scaled = self._bg_pixmap.scaled(
                 self.size(),
@@ -257,13 +314,13 @@ class LockScreen(QWidget):
             self.width() / 2, self.height() / 2,
             max(self.width(), self.height()) / 1.5
         )
-        gradient.setColorAt(0, QColor(10, 10, 30, 180))
-        gradient.setColorAt(0.7, QColor(5, 5, 20, 210))
-        gradient.setColorAt(1, QColor(0, 0, 10, 240))
+        gradient.setColorAt(0, QColor(10, 10, 30, 160 if self._bg_type == "video" else 180))
+        gradient.setColorAt(0.7, QColor(5, 5, 20, 190 if self._bg_type == "video" else 210))
+        gradient.setColorAt(1, QColor(0, 0, 10, 220 if self._bg_type == "video" else 240))
         painter.fillRect(self.rect(), gradient)
 
         # Subtle noise/grain effect via dark overlay
-        painter.fillRect(self.rect(), QColor(0, 0, 0, 60))
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 40 if self._bg_type == "video" else 60))
 
         painter.end()
 
