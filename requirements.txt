@@ -1,0 +1,5 @@
+# Fingerprint Lock Screen — Dependencies
+# Most are already available on Fedora 44
+PyQt6>=6.5.0
+dbus-python>=1.3.0
+python-pam>=2.0.0

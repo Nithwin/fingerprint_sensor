@@ -19,6 +19,8 @@ class Config:
         "show_clock": True,
         "show_battery": True,
         "show_network": True,
+        "background_type": "blur",       # "blur", "image", or "video"
+        "background_path": "",           # Path to image/video file
         "blur_radius": 40,              # Wallpaper blur radius
         "theme": "dark",                # "dark" or "light"
         "accent_color": "#3B82F6",      # Blue accent
@@ -30,6 +32,7 @@ class Config:
         "lock_on_lid_close": True,
         "enable_sound": False,
         "font_family": "Inter",
+        "is_default_lock": False,       # Whether we are the default lock screen
     }
 
     def __init__(self):
