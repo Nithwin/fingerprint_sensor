@@ -1,0 +1,480 @@
+# 🔐 Fingerprint Screen Lock — Implementation Plan
+
+## System Profile
+
+| Component | Details |
+|---|---|
+| **OS** | Fedora 44 (kernel 7.0.9) |
+| **Desktop** | GNOME on Wayland |
+| **Sensor** | ELAN 04f3:0c00 (ELAN:ARM-M4) via USB |
+| **Python** | 3.14.4 |
+| **fprintd** | 1.94.5 (running, but **sensor not detected** — needs driver fix) |
+| **libfprint** | 1.94.10 (stock — **does not support your ELAN sensor**) |
+
+---
+
+## ⚠️ Critical Finding: Your Sensor Needs a Custom Driver
+
+> [!CAUTION]
+> Your ELAN 04f3:0c00 fingerprint sensor is **NOT supported** by the stock `libfprint` shipped with Fedora 44. The `fprintd-list` command returns "No devices available". This is a known issue — the community has a working fix via the `elanmoc2` branch.
+
+**This must be fixed first before any lock screen work can begin.**
+
+---
+
+## 🏗️ Tech Stack Recommendation
+
+### Why **Python + PyQt6** is the best choice:
+
+| Factor | Python + PyQt6 | C++ + Qt6 | Rust + GTK4 |
+|---|---|---|---|
+| **Development Speed** | ⭐⭐⭐⭐⭐ Fastest | ⭐⭐ Slow | ⭐⭐ Slow |
+| **Animation Framework** | ⭐⭐⭐⭐⭐ QPropertyAnimation, QPainter, QGraphicsEffect | ⭐⭐⭐⭐⭐ Same | ⭐⭐⭐ Limited |
+| **D-Bus Integration** | ⭐⭐⭐⭐⭐ `dbus-python` already installed | ⭐⭐⭐⭐ QtDBus | ⭐⭐⭐ zbus crate |
+| **PAM Integration** | ⭐⭐⭐⭐⭐ `python3-pam` already installed | ⭐⭐⭐ Manual C binding | ⭐⭐⭐ pam crate |
+| **Wayland Fullscreen** | ⭐⭐⭐⭐ Works well | ⭐⭐⭐⭐ Same | ⭐⭐⭐⭐ Works |
+| **Maintainability** | ⭐⭐⭐⭐⭐ Easy to modify | ⭐⭐⭐ Complex | ⭐⭐⭐ Borrow checker |
+| **Already Installed** | ✅ PyQt6 6.11.0 + dbus-python + python3-pam | ❌ Need Qt6 dev headers | ❌ Need full Rust toolchain |
+
+### ✅ Chosen Stack
+
+```
+┌─────────────────────────────────────────────────┐
+│              Fingerprint Lock Screen            │
+├─────────────────────────────────────────────────┤
+│  UI Layer:     Python 3.14 + PyQt6 6.11        │
+│  Animations:   QPropertyAnimation + QPainter    │
+│  Fingerprint:  fprintd via D-Bus (dbus-python)  │
+│  Auth:         PAM (python3-pam)                │
+│  Lock:         Wayland fullscreen overlay        │
+│  Service:      systemd user service + D-Bus     │
+│  Enrollment:   PyQt6 management GUI              │
+└─────────────────────────────────────────────────┘
+```
+
+---
+
+## 📐 Architecture Overview
+
+```mermaid
+graph TB
+    subgraph "User Space"
+        A["Lock Screen UI<br/>(PyQt6 + Animations)"] --> B["Fingerprint Manager<br/>(D-Bus Client)"]
+        A --> C["PAM Auth<br/>(Fallback Password)"]
+        D["Enrollment GUI<br/>(PyQt6)"] --> B
+        E["systemd user service"] --> A
+    end
+    
+    subgraph "System Services"
+        B --> F["fprintd<br/>(D-Bus Service)"]
+        F --> G["libfprint<br/>(elanmoc2 driver)"]
+        C --> H["PAM Stack"]
+    end
+    
+    subgraph "Hardware"
+        G --> I["ELAN 04f3:0c00<br/>Fingerprint Sensor"]
+    end
+    
+    J["GNOME Session Lock"] -.->|"triggers"| A
+```
+
+---
+
+## 📋 Implementation Phases
+
+### Phase 0: Fix the Hardware Driver (PREREQUISITE)
+
+> [!IMPORTANT]
+> This phase must be completed before anything else. Without it, the sensor is invisible to Linux.
+
+**Steps:**
+
+1. **Install build dependencies**
+   ```bash
+   sudo dnf install glib2-devel libgusb-devel gobject-introspection-devel \
+     pixman-devel nss-devel libgudev-devel gtk-doc meson ninja-build
+   ```
+
+2. **Clone and build the elanmoc2 driver**
+   ```bash
+   cd ~/Desktop/fingerprint_sensor
+   git clone https://gitlab.freedesktop.org/depau/libfprint.git libfprint-elanmoc2
+   cd libfprint-elanmoc2
+   git switch elanmoc2
+   meson setup builddir
+   cd builddir
+   ninja
+   sudo ninja install
+   ```
+
+3. **Configure library path**
+   ```bash
+   echo -e "/usr/local/lib\n/usr/local/lib64" | sudo tee /etc/ld.so.conf.d/local-libfprint.conf
+   sudo ldconfig
+   ```
+
+4. **Restart fprintd and verify**
+   ```bash
+   sudo systemctl restart fprintd.service
+   fprintd-list $USER   # Should now show a device!
+   ```
+
+5. **Test basic enrollment**
+   ```bash
+   fprintd-enroll        # Enroll a test finger
+   fprintd-verify        # Verify it works
+   ```
+
+**Expected Outcome:** `fprintd-list` shows the ELAN device; enrollment and verification work.
+
+---
+
+### Phase 1: Core Fingerprint D-Bus Client
+
+**Goal:** Python module that talks to fprintd via D-Bus for enroll/verify/delete/list operations.
+
+**Files:**
+```
+fingerprint_sensor/
+├── src/
+│   ├── __init__.py
+│   ├── fingerprint_dbus.py      # D-Bus client for fprintd
+│   ├── auth.py                  # PAM authentication (password fallback)
+│   └── config.py                # App configuration
+```
+
+**Key Features:**
+- `FingerprintManager` class wrapping all fprintd D-Bus calls
+- Async fingerprint verification with signal callbacks
+- Enrollment flow with progress tracking (fprintd needs multiple swipes)
+- List enrolled fingers, delete specific fingers
+- Support for naming fingers (stored in local config)
+- Error handling for device busy, sensor dirty, swipe too short, etc.
+
+**D-Bus Interface Used:**
+```
+Service:    net.reactivated.Fprint
+Object:     /net/reactivated/Fprint/Device/0
+Interfaces: net.reactivated.Fprint.Device
+Methods:    Claim, Release, EnrollStart, EnrollStop, 
+            VerifyStart, VerifyStop, ListEnrolledFingers, 
+            DeleteEnrolledFingers, DeleteEnrolledFinger2
+Signals:    VerifyStatus, EnrollStatus, VerifyFingerSelected
+```
+
+---
+
+### Phase 2: Lock Screen UI with Animations
+
+**Goal:** A stunning, Windows Hello-inspired lock screen with fluid animations.
+
+**Files:**
+```
+├── src/
+│   ├── lock_screen.py           # Main lock screen window
+│   ├── widgets/
+│   │   ├── fingerprint_widget.py    # Animated fingerprint icon
+│   │   ├── clock_widget.py          # Date/time display
+│   │   ├── status_widget.py         # Status messages
+│   │   ├── password_widget.py       # Fallback password input
+│   │   └── user_avatar.py           # User profile picture
+│   ├── animations/
+│   │   ├── ripple.py                # Ripple effect on touch
+│   │   ├── pulse.py                 # Pulse glow while scanning
+│   │   ├── success.py               # Green checkmark morph
+│   │   ├── failure.py               # Red shake animation
+│   │   └── particles.py             # Particle burst on success
+│   └── assets/
+│       ├── fingerprint.svg          # Fingerprint icon
+│       ├── wallpaper_blur.py        # Blur current wallpaper
+│       └── fonts/                   # Custom fonts
+```
+
+**UI Layout (Windows Hello-inspired):**
+
+```
+┌──────────────────────────────────────────────────────┐
+│                                                      │
+│              Blurred Desktop Wallpaper               │
+│                                                      │
+│                  ┌──────────┐                        │
+│                  │  Avatar  │                        │
+│                  │  (80px)  │                        │
+│                  └──────────┘                        │
+│                                                      │
+│                  shadow                              │
+│                                                      │
+│              ┌────────────────┐                      │
+│              │  ╭──────────╮  │                      │
+│              │  │ 🔑       │  │  ← Fingerprint      │
+│              │  │Fingerprint│  │    Widget with      │
+│              │  │  Pulse   │  │    pulsing glow     │
+│              │  ╰──────────╯  │                      │
+│              └────────────────┘                      │
+│                                                      │
+│           "Touch sensor to unlock"                   │
+│                                                      │
+│        ┌──────────────────────────┐                  │
+│        │  Password (click to show) │  ← Fallback    │
+│        └──────────────────────────┘                  │
+│                                                      │
+│   🔋 85%    📶 Connected    10:37 AM  Jun 23, 2026  │
+│                                                      │
+└──────────────────────────────────────────────────────┘
+```
+
+**Animation Details:**
+
+| Animation | Trigger | Description | Duration |
+|---|---|---|---|
+| **Idle Pulse** | Always (while locked) | Fingerprint icon gently pulses with a blue glow ring | 2s loop |
+| **Scanning Ripple** | Finger detected | Concentric rings expand outward from icon | 0.8s |
+| **Progress Ring** | During verification | Circular progress around fingerprint fills up | 1-2s |
+| **Success Burst** | Verified! | Green check morphs in + particle burst + screen fades out | 0.6s |
+| **Failure Shake** | Bad fingerprint | Icon shakes left-right + red flash + "Try again" | 0.5s |
+| **Retry Fade** | After failure | Smoothly returns to idle state | 0.3s |
+| **Background Blur** | Lock activates | Current desktop blurs in (like Windows) | 0.4s |
+| **Clock Fade-in** | Lock activates | Time and date fade in from bottom | 0.5s |
+
+**Technology for Animations:**
+- `QPropertyAnimation` for position, opacity, scale transforms
+- `QPainter` with `QRadialGradient` for the glow/ripple effects
+- `QGraphicsOpacityEffect` for fade transitions
+- `QTimer` for idle animation loops
+- Custom `QPainterPath` for fingerprint SVG rendering
+
+---
+
+### Phase 3: Enrollment Management GUI
+
+**Goal:** A settings-like window to add, name, test, and remove fingerprints.
+
+**Files:**
+```
+├── src/
+│   ├── enrollment_window.py     # Main enrollment GUI
+│   ├── widgets/
+│   │   ├── finger_selector.py   # Visual hand diagram to select finger
+│   │   ├── enroll_progress.py   # Progress during enrollment
+│   │   └── finger_card.py       # Card showing enrolled finger
+```
+
+**Features:**
+- **Visual hand diagram** — click on a finger to enroll it (like Windows)
+- **Step-by-step enrollment** — "Place finger 1 of 5... 2 of 5..."
+- **Progress animation** during each swipe
+- **Name your fingerprints** — "Right Index", "Left Thumb", etc.
+- **Test enrolled fingerprint** — verify without locking
+- **Delete individual fingers** or clear all
+- **Support up to 10 fingerprints** (one per finger)
+
+**Enrollment Flow:**
+```mermaid
+sequenceDiagram
+    participant User
+    participant GUI
+    participant fprintd
+    
+    User->>GUI: Click "Add Fingerprint"
+    GUI->>GUI: Show hand diagram
+    User->>GUI: Select finger (e.g., right-index)
+    GUI->>fprintd: Claim device
+    GUI->>fprintd: EnrollStart(right-index-finger)
+    
+    loop 3-5 times
+        fprintd-->>GUI: EnrollStatus(enroll-stage-passed)
+        GUI->>GUI: Update progress (1/5, 2/5...)
+        GUI->>User: "Lift and place finger again"
+    end
+    
+    fprintd-->>GUI: EnrollStatus(enroll-completed)
+    GUI->>GUI: Show success animation
+    GUI->>fprintd: Release device
+    GUI->>User: "Fingerprint saved!"
+```
+
+---
+
+### Phase 4: Screen Lock Integration
+
+**Goal:** Integrate with GNOME/Fedora so the lock screen activates properly.
+
+**Approach:** Use the **ext-session-lock-v1** Wayland protocol (the proper way to create lock screens on Wayland compositors like GNOME's Mutter).
+
+**Files:**
+```
+├── src/
+│   ├── session_lock.py          # Wayland session lock protocol
+│   ├── screen_manager.py        # Multi-monitor support
+│   └── dbus_service.py          # D-Bus service for lock/unlock triggers
+├── config/
+│   ├── fingerprint-lock.service # systemd user service
+│   └── fingerprint-lock.desktop # Autostart entry
+```
+
+**Lock Triggers:**
+- **Manual:** `Super+L` keybinding or D-Bus call
+- **Automatic:** After suspend/resume, after idle timeout
+- **GNOME integration:** Listen to `org.gnome.ScreenSaver` D-Bus signals
+
+**Security Measures:**
+- Fullscreen on ALL monitors (multi-monitor support)
+- Grab keyboard input to prevent Alt+Tab, Ctrl+Alt+Del bypass
+- PAM password fallback if fingerprint fails 3 times
+- No way to dismiss without auth
+- Session lock protocol prevents window switching
+
+---
+
+### Phase 5: Polish, Testing & System Integration
+
+**Files:**
+```
+├── install.sh                   # Automated installer
+├── uninstall.sh                 # Clean uninstaller
+├── requirements.txt             # Python dependencies
+├── config/
+│   ├── fingerprint-lock.conf    # User configuration
+│   └── 50-fingerprint-lock.rules  # udev rules (optional)
+├── tests/
+│   ├── test_dbus_client.py
+│   ├── test_animations.py
+│   └── test_pam_auth.py
+└── README.md
+```
+
+**System Integration Tasks:**
+1. Create systemd user service for auto-start
+2. Register D-Bus service for lock/unlock commands
+3. Add GNOME keyboard shortcut for manual lock
+4. Handle suspend/resume events (lock on lid close)
+5. Multi-monitor wallpaper blur
+6. Graceful fallback if sensor disconnected
+
+---
+
+## 📁 Final Project Structure
+
+```
+fingerprint_sensor/
+├── src/
+│   ├── __init__.py
+│   ├── main.py                     # Entry point
+│   ├── config.py                   # Configuration management
+│   ├── fingerprint_dbus.py         # fprintd D-Bus client
+│   ├── auth.py                     # PAM authentication
+│   ├── lock_screen.py              # Lock screen window
+│   ├── enrollment_window.py        # Enrollment management GUI
+│   ├── session_lock.py             # Wayland session lock
+│   ├── screen_manager.py           # Multi-monitor handling
+│   ├── dbus_service.py             # D-Bus service interface
+│   ├── widgets/
+│   │   ├── __init__.py
+│   │   ├── fingerprint_widget.py   # Animated fingerprint icon
+│   │   ├── clock_widget.py         # Date/time display
+│   │   ├── status_widget.py        # Status messages
+│   │   ├── password_widget.py      # Password input fallback
+│   │   ├── user_avatar.py          # User avatar display
+│   │   ├── finger_selector.py      # Hand diagram for enrollment
+│   │   ├── enroll_progress.py      # Enrollment progress widget
+│   │   └── finger_card.py          # Enrolled finger display card
+│   ├── animations/
+│   │   ├── __init__.py
+│   │   ├── ripple.py               # Ripple effect
+│   │   ├── pulse.py                # Pulse glow
+│   │   ├── success.py              # Success animation
+│   │   ├── failure.py              # Failure animation
+│   │   └── particles.py            # Particle effects
+│   └── assets/
+│       ├── fingerprint.svg
+│       ├── hand_left.svg
+│       ├── hand_right.svg
+│       ├── icons/
+│       └── fonts/
+├── config/
+│   ├── fingerprint-lock.service    # systemd service
+│   ├── fingerprint-lock.desktop    # autostart
+│   └── fingerprint-lock.conf      # user config
+├── scripts/
+│   ├── install.sh                  # Installer
+│   ├── uninstall.sh                # Uninstaller
+│   └── setup-driver.sh             # ELAN driver setup
+├── tests/
+│   ├── test_dbus_client.py
+│   ├── test_animations.py
+│   └── test_pam_auth.py
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## 🔄 Execution Order
+
+```mermaid
+gantt
+    title Implementation Timeline
+    dateFormat X
+    axisFormat %s
+    
+    section Phase 0 - Driver
+    Install build deps           :a1, 0, 1
+    Build elanmoc2 libfprint     :a2, 1, 3
+    Verify sensor detection      :a3, 3, 4
+    
+    section Phase 1 - Core
+    D-Bus fingerprint client     :b1, 4, 6
+    PAM auth module              :b2, 4, 5
+    Configuration system         :b3, 5, 6
+    
+    section Phase 2 - Lock UI
+    Base lock screen window      :c1, 6, 8
+    Fingerprint widget           :c2, 8, 10
+    Animations (pulse/ripple)    :c3, 10, 12
+    Success/failure effects      :c4, 12, 13
+    Clock and status widgets     :c5, 8, 9
+    
+    section Phase 3 - Enrollment
+    Hand diagram selector        :d1, 13, 15
+    Enrollment flow              :d2, 15, 17
+    Management GUI               :d3, 17, 18
+    
+    section Phase 4 - Integration
+    Session lock protocol        :e1, 18, 20
+    Multi-monitor support        :e2, 20, 21
+    systemd service              :e3, 21, 22
+    
+    section Phase 5 - Polish
+    Testing                      :f1, 22, 24
+    Installer scripts            :f2, 24, 25
+    Documentation                :f3, 25, 26
+```
+
+---
+
+## 🎨 Design Inspiration
+
+The lock screen will follow the **Windows Hello** aesthetic with Linux-native feel:
+
+- **Frosted glass** blurred background (current wallpaper with gaussian blur)
+- **Soft blue glow** pulsing around the fingerprint icon
+- **Clean typography** using Inter or Cantarell (GNOME default)
+- **Minimal UI** — only essential info visible
+- **Dark theme** with subtle transparency
+- **Smooth 60fps animations** using Qt's animation framework
+- **Color states:** Blue (waiting) → Amber (scanning) → Green (success) / Red (failure)
+
+---
+
+## 🚦 Next Steps
+
+> [!IMPORTANT]
+> **Please confirm the following before we begin building:**
+> 
+> 1. **Are you okay with Phase 0?** We need to build a custom `libfprint` for your ELAN sensor first. This involves compiling from source. Are you comfortable with that?
+> 2. **Do you want the lock screen to replace GNOME's built-in lock**, or work alongside it as an additional layer?
+> 3. **Should the enrollment GUI be a standalone app** (launched from terminal/app menu), or integrated into GNOME Settings?
+> 4. **Any specific animation preferences?** (e.g., more subtle, more flashy, specific colors?)
+> 5. **Do you want password-only fallback**, or also PIN support?
+
+Once you confirm, I'll start with **Phase 0** (fixing your driver) and then immediately move to building the lock screen.
