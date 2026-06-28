@@ -503,8 +503,7 @@ Description=Fingerprint Lock Screen Service
 After=graphical-session.target
 
 [Service]
-Type=dbus
-BusName=org.freedesktop.ScreenSaver
+Type=simple
 ExecStart=/usr/bin/python3 -m src.main dbus-service
 WorkingDirectory={project}
 Restart=on-failure

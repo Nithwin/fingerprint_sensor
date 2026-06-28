@@ -375,8 +375,14 @@ class LockScreen(QWidget):
             self._switch_to_password()
             return
 
+        def do_start():
+            if not self._fp.start_verify("any", on_status=on_verify):
+                self._is_verifying = False
+                self._status.set_error("Failed to start fingerprint scanner")
+                self._switch_to_password()
+
         # Brief delay then start verify
-        QTimer.singleShot(500, lambda: self._fp.start_verify("any", on_status=on_verify))
+        QTimer.singleShot(500, do_start)
 
     def _on_verify_success(self):
         """Handle successful fingerprint verification."""
@@ -394,14 +400,13 @@ class LockScreen(QWidget):
 
     def _after_failure(self, remaining: int):
         """After failure animation completes."""
-        try:
-            self._fp.release_device()
-        except Exception:
-            pass
-
         if remaining <= 0:
             self._switch_to_password()
         else:
+            try:
+                self._fp.release_device()
+            except Exception:
+                pass
             # Retry fingerprint after a short delay
             QTimer.singleShot(1000, self._start_fingerprint_verify)
 

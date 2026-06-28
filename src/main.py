@@ -191,6 +191,9 @@ def main():
         cmd_status()
     elif command == "test":
         cmd_test()
+    elif command == "dbus-service":
+        from src.session_lock import run_dbus_service
+        run_dbus_service()
     else:
         print(f"Unknown command: {command}")
         print(__doc__)

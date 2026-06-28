@@ -203,6 +203,7 @@ class FingerprintManager:
             return True
         except dbus.exceptions.DBusException as e:
             print(f"[FP] Error starting enrollment: {e}")
+            self._claimed = False
             return False
 
     def stop_enrollment(self) -> bool:
@@ -235,6 +236,7 @@ class FingerprintManager:
             return True
         except dbus.exceptions.DBusException as e:
             print(f"[FP] Error starting verify: {e}")
+            self._claimed = False
             return False
 
     def stop_verify(self) -> bool:
